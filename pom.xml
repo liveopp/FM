@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.iqiyi.ml</groupId>
+    <artifactId>FMTest</artifactId>
+    <version>1.0-SNAPSHOT</version>
+
+    <properties>
+        <java.version>1.8</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <scala.version>2.10.6</scala.version>
+        <scala.main.version>2.10</scala.main.version>
+        <spark.version>2.0.0</spark.version>
+        <europa.version>2.3.0</europa.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.scalanlp</groupId>
+            <artifactId>breeze_${scala.main.version}</artifactId>
+            <version>0.12</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-core_${scala.main.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.main.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-mllib_${scala.main.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <repositories>
+        <repository>
+            <id>iqiyi-internal-repo</id>
+            <name>Iqiyi Internal</name>
+            <url>http://maven.qiyi.virtual/a/repository</url>
+        </repository>
+    </repositories>
+
+    <pluginRepositories>
+        <pluginRepository>
+            <id>iqiyi-internal-repo</id>
+            <name>Iqiyi Internal</name>
+            <url>http://maven.qiyi.virtual/a/repository</url>
+        </pluginRepository>
+    </pluginRepositories>
+    <build>
+        <sourceDirectory>src/main/scala</sourceDirectory>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.5.1</version>
+                <configuration>
+                    <!-- <defaultLibBundleDir>lib</defaultLibBundleDir> -->
+                    <source>${java.version}</source>
+                    <target>${java.version}</target>
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>3.1.6</version>
+                <executions>
+
+                    <execution>
+                        <id>compile</id>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                        <phase>compile</phase>
+                    </execution>
+                    <execution>
+                        <id>test-compile</id>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                        <phase>test-compile</phase>
+                    </execution>
+                    <execution>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <scalaVersion>${scala.version}</scalaVersion>
+                    <recompileMode>incremental</recompileMode>
+                    <useZincServer>true</useZincServer>
+                    <args>
+                        <arg>-unchecked</arg>
+                        <arg>-deprecation</arg>
+                        <arg>-feature</arg>
+                    </args>
+                    <javacArgs>
+                        <javacArg>-source</javacArg>
+                        <javacArg>${java.version}</javacArg>
+                        <javacArg>-target</javacArg>
+                        <javacArg>${java.version}</javacArg>
+                    </javacArgs>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>com.iqiyi.europa</groupId>
+                <artifactId>europa-maven-plugin</artifactId>
+                <version>${europa.version}</version>
+                <configuration>
+                    <token>jimmyzhang@MCILGAEXANHFHWOKYAZXUFPRAJMYRTKN</token>
+                    <project>cupid_algo</project>
+                    <jar>target/${project.artifactId}-${project.version}.jar</jar>
+                    <mainClass>TestFM</mainClass>
+                    <jobName>cupid_algo_cpc_test_fm</jobName>
+                    <cluster>Jiyang</cluster>
+                    <principal>cupid_algo</principal>
+                    <queue>cupid_spark</queue>
+                    <sparkVersion>${spark.version}</sparkVersion>
+                    <driverMemory>10</driverMemory>
+                    <driverCores>4</driverCores>
+                    <numExecutors>50</numExecutors>
+                    <executorCores>2</executorCores>
+                    <executorMemory>10</executorMemory>
+                    <alert></alert>
+                    <log4jLevel>ERROR</log4jLevel>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+</project>
