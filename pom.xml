@@ -4,26 +4,20 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>com.iqiyi.ml</groupId>
-    <artifactId>FMTest</artifactId>
+    <groupId>org.apache.spark</groupId>
+    <artifactId>spark-fm</artifactId>
     <version>1.0-SNAPSHOT</version>
 
     <properties>
         <java.version>1.8</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <scala.version>2.10.6</scala.version>
-        <scala.main.version>2.10</scala.main.version>
+        <scala.version>2.11.6</scala.version>
+        <scala.main.version>2.11</scala.main.version>
         <spark.version>2.0.0</spark.version>
         <europa.version>2.3.0</europa.version>
     </properties>
 
     <dependencies>
-        <dependency>
-            <groupId>org.scalanlp</groupId>
-            <artifactId>breeze_${scala.main.version}</artifactId>
-            <version>0.12</version>
-            <scope>provided</scope>
-        </dependency>
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-core_${scala.main.version}</artifactId>
@@ -126,17 +120,16 @@
                     <project>cupid_algo</project>
                     <jar>target/${project.artifactId}-${project.version}.jar</jar>
                     <mainClass>TestFM</mainClass>
-                    <jobName>cupid_algo_cpc_test_fm</jobName>
+                    <jobName>cupid_algo_test_fm</jobName>
                     <cluster>Jiyang</cluster>
                     <principal>cupid_algo</principal>
                     <queue>cupid_spark</queue>
                     <sparkVersion>${spark.version}</sparkVersion>
                     <driverMemory>10</driverMemory>
                     <driverCores>4</driverCores>
-                    <numExecutors>50</numExecutors>
+                    <numExecutors>20</numExecutors>
                     <executorCores>2</executorCores>
                     <executorMemory>10</executorMemory>
-                    <alert></alert>
                     <log4jLevel>ERROR</log4jLevel>
                 </configuration>
             </plugin>
