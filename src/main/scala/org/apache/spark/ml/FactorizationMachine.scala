@@ -18,6 +18,7 @@
 package org.apache.spark.ml.classification
 
 import scala.collection.mutable
+import scala.util.Random
 import breeze.linalg.{*, sum, DenseVector => BDV}
 import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS, OWLQN => BreezeOWLQN}
 import org.apache.hadoop.fs.Path
@@ -326,11 +327,18 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
         val optimizer = if ($(elasticNetParam) == 0.0 || $(regParam) == 0.0) {
           new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
         } else {
-          throw new SparkException("L1 regularation is not implemented")
+          throw new NotImplementedError("L1 regularation is not implemented")
         }
 
-        val initialCoefficientsWithIntercept =
-          Vectors.zeros(numFeatures * (numFactors + 1) + (if ($(fitIntercept)) 1 else 0))
+        val initialCoefficientsArray = Array.fill[Double](
+          numFeatures * (numFactors + 1) + (if ($(fitIntercept)) 1 else 0))(
+          1 / math.sqrt(numFactors) * (Random.nextDouble - 0.5))
+        var i = 0
+        while (i < numFeatures) {
+          initialCoefficientsArray(i) = 0.0
+          i += 1
+        }
+        val initialCoefficientsWithIntercept = Vectors.dense(initialCoefficientsArray)
 
         if ($(fitIntercept)) {
           /*
@@ -422,14 +430,13 @@ object FactorizationMachine extends DefaultParamsReadable[FactorizationMachine] 
 /**
   * Model produced by [[FactorizationMachine]].
   */
-@Since("1.4.0")
 class FactorizationMachineModel private[spark](
                                                 override val uid: String,
                                                 val numFactors: Int,
                                                 val coefficients: Vector,
                                                 val intercept: Double)
   extends ProbabilisticClassificationModel[Vector, FactorizationMachineModel]
-    with LogisticRegressionParams with MLWritable {
+    with FactorizationMachineParams with MLWritable {
 
   override def setThreshold(value: Double): this.type = super.setThreshold(value)
 
@@ -439,8 +446,9 @@ class FactorizationMachineModel private[spark](
 
   override def getThresholds: Array[Double] = super.getThresholds
 
+  override val numFeatures: Int = coefficients.size / (numFactors + 1)
+
   private val factorNorms = {
-    val numFeatures = this.numFeatures
     val coeffs = BDV(coefficients.toArray)
     val factorMatrix = coeffs(numFeatures until numFeatures * (numFactors + 1))
       .toDenseMatrix
@@ -454,20 +462,21 @@ class FactorizationMachineModel private[spark](
     val factorSumArray = Array.ofDim[Double](numFactors)
     val coefficientsArray = coefficients.toArray
     val numFeatures = features.size
-    - {
-      var sum = 0.0
-      features.foreachActive { (index, value) =>
-        if (value != 0.0) {
-          sum += coefficientsArray(index) * value
-          sum -= 0.5 * factorNorms(index) * value * value
-          for (iFactor <- 0 until numFactors) {
-            factorSumArray(iFactor) += coefficientsArray((iFactor + 1) * numFeatures) * value
-          }
+    var sum = 0.0
+    features.foreachActive { (index, value) =>
+      if (value != 0.0) {
+        sum += coefficientsArray(index) * value
+        sum -= 0.5 * factorNorms(index) * value * value
+        var iFactor = 0
+        while (iFactor < numFactors) {
+          val factorIndex = (iFactor + 1) * numFeatures + index
+          factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
+          iFactor += 1
         }
       }
-      sum += 0.5 * factorSumArray.map(f => f * f).sum
-      sum + intercept
     }
+    sum += 0.5 * factorSumArray.map(f => f * f).sum
+    sum + intercept
   }
 
   /** Score (probability) for class label 1.  For binary classification only. */
@@ -476,7 +485,6 @@ class FactorizationMachineModel private[spark](
     1.0 / (1.0 + math.exp(-m))
   }
 
-  override val numFeatures: Int = coefficients.size / numFactors
 
   override val numClasses: Int = 2
 
@@ -815,12 +823,12 @@ private class FactorAggregator(
                                 private val numFeatures: Int,
                                 private val numFactors: Int,
                                 numClasses: Int,
-                                fitIntercept: Boolean) extends Serializable {
+                                fitIntercept: Boolean) extends Serializable with Logging {
 
   private var weightSum = 0.0
   private var lossSum = 0.0
+  private var iFactor = 0
 
-  private val factorSumArray = Array.ofDim[Double](numFactors)
   private val gradientSumArray =
     Array.ofDim[Double](numFeatures * (numFactors + 1) + (if (fitIntercept) 1 else 0))
 
@@ -850,6 +858,7 @@ private class FactorAggregator(
             s"coefficients only supports dense vector but got type ${coefficients.getClass}.")
       }
       val localGradientSumArray = gradientSumArray
+      val factorSumArray = Array.ofDim[Double](numFactors)
 
       numClasses match {
         case 2 =>
@@ -860,8 +869,11 @@ private class FactorAggregator(
               if (value != 0.0) {
                 sum += coefficientsArray(index) * value
                 sum -= 0.5 * factorNorms(index) * value * value
-                for (iFactor <- 0 until numFactors) {
-                  factorSumArray(iFactor) += coefficientsArray((iFactor + 1) * numFeatures) * value
+                iFactor = 0
+                while (iFactor < numFactors) {
+                  val factorIndex = (iFactor + 1) * numFeatures + index
+                  factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
+                  iFactor += 1
                 }
               }
             }
@@ -876,16 +888,18 @@ private class FactorAggregator(
           features.foreachActive { (index, value) =>
             if (value != 0.0) {
               localGradientSumArray(index) += multiplier * value
-              for (iFactor <- 0 until numFactors) {
+              iFactor = 0
+              while (iFactor < numFactors) {
                 val factorIndex = (iFactor + 1) * numFeatures + index
                 localGradientSumArray(factorIndex) += multiplier * value *
                   (factorSumArray(iFactor) - coefficientsArray(factorIndex) * value)
+                iFactor += 1
               }
             }
           }
 
           if (fitIntercept) {
-            localGradientSumArray(numFeatures) += multiplier
+            localGradientSumArray(numFeatures * (numFactors + 1)) += multiplier
           }
 
           if (label > 0) {
@@ -934,6 +948,7 @@ private class FactorAggregator(
   def loss: Double = {
     require(weightSum > 0.0, s"The effective number of instances should be " +
       s"greater than 0.0, but $weightSum.")
+    println(s"weightSum : $weightSum, lossSum: $lossSum")
     lossSum / weightSum
   }
 
@@ -988,7 +1003,7 @@ private class FactorCostFun(
       coeffs.foreachActive { (index, value) =>
         // If `fitIntercept` is true, the last term which is intercept doesn't
         // contribute to the regularization.
-        if (index != numFeatures) {
+        if (index != numFeatures * (numFactors + 1)) {
           // The following code will compute the loss of the regularization; also
           // the gradient of the regularization, and add back to totalGradientArray.
           sum += {
@@ -1000,6 +1015,7 @@ private class FactorCostFun(
       0.5 * regParamL2 * sum
     }
 
+    println(s"factorAggregator loss: ${factorAggregator.loss}, regval: $regVal")
     (factorAggregator.loss + regVal, new BDV(totalGradientArray))
   }
 }
