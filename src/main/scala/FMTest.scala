@@ -82,9 +82,8 @@ object FMTest {
     val output = assembler.transform(onehotDF).select("features", "label")
     val Array(trainingData, testData) = output.randomSplit(Array(0.7, 0.3))
 
-    val fm = new FactorizationMachine(10)
+    val fm = new FM()
       .setMaxIter(50)
-      .setRegParam(0.00004)
 
     val fmModel = fm.fit(trainingData)
     println(s"Coefficients: ${fmModel.coefficients} Intercept: ${fmModel.intercept}")

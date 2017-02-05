@@ -20,10 +20,11 @@ package org.apache.spark.ml.classification
 import scala.collection.mutable
 import scala.util.Random
 import breeze.linalg.{*, sum, DenseVector => BDV}
-import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS, OWLQN => BreezeOWLQN}
+import breeze.optimize.{DiffFunction, CachedDiffFunction, LBFGS => BreezeLBFGS}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.SparkException
 import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.feature.Instance
 import org.apache.spark.ml.linalg._
@@ -40,11 +41,39 @@ import org.apache.spark.sql.types.DoubleType
 import org.apache.spark.storage.StorageLevel
 
 /**
-  * Params for logistic regression.
+  * Params for factorization machine.
   */
-private[classification] trait FactorizationMachineParams extends ProbabilisticClassifierParams
-  with HasRegParam with HasElasticNetParam with HasMaxIter with HasFitIntercept with HasTol
-  with HasStandardization with HasWeightCol with HasThreshold {
+private[classification] trait FMParams extends ProbabilisticClassifierParams
+  with HasMaxIter with HasFitIntercept with HasTol with HasWeightCol with HasThreshold {
+
+  /**
+    * Param for rank of the factorization (positive).
+    * @group param
+    */
+  val rank = new IntParam(this, "rank", "rank of the factorization", ParamValidators.gtEq(1))
+
+  /** @group getParam */
+  def getRank: Int = $(rank)
+
+  /**
+    * Param for L2 regularization of first-order weights (positive).
+    * @group param
+    */
+  val regParamFirst = new DoubleParam(this, "regParamFirst",
+    "L2-regularization parameter for first-order weights", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegParamFirst: Double = $(regParamFirst)
+
+  /**
+    * Param for L2 regularization of second-order factors (positive).
+    * @group param
+    */
+  val regParamSecond = new DoubleParam(this, "regParamSecond",
+    "L2 regularization parameter for second-order factors", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegParamSecond: Double = $(regParamSecond)
 
   /**
     * Set threshold in binary classification, in range [0, 1].
@@ -53,140 +82,66 @@ private[classification] trait FactorizationMachineParams extends ProbabilisticCl
     * A high threshold encourages the model to predict 0 more often;
     * a low threshold encourages the model to predict 1 more often.
     *
-    * Note: Calling this with threshold p is equivalent to calling `setThresholds(Array(1-p, p))`.
-    *       When [[setThreshold()]] is called, any user-set value for [[thresholds]] will be cleared.
-    *       If both [[threshold]] and [[thresholds]] are set in a ParamMap, then they must be
-    *       equivalent.
-    *
     * Default is 0.5.
     * @group setParam
     */
-  def setThreshold(value: Double): this.type = {
-    if (isSet(thresholds)) clear(thresholds)
-    set(threshold, value)
-  }
+  def setThreshold(value: Double): this.type = set(threshold, value)
 
   /**
     * Get threshold for binary classification.
     *
-    * If [[thresholds]] is set with length 2 (i.e., binary classification),
-    * this returns the equivalent threshold: {{{1 / (1 + thresholds(0) / thresholds(1))}}}.
-    * Otherwise, returns [[threshold]] if set, or its default value if unset.
-    *
     * @group getParam
     * @throws IllegalArgumentException if [[thresholds]] is set to an array of length other than 2.
     */
-  override def getThreshold: Double = {
-    checkThresholdConsistency()
-    if (isSet(thresholds)) {
-      val ts = $(thresholds)
-      require(ts.length == 2, "Logistic Regression getThreshold only applies to" +
-        " binary classification, but thresholds has length != 2.  thresholds: " + ts.mkString(","))
-      1.0 / (1.0 + ts(0) / ts(1))
-    } else {
-      $(threshold)
-    }
-  }
-
-  /**
-    * Set thresholds in multiclass (or binary) classification to adjust the probability of
-    * predicting each class. Array must have length equal to the number of classes, with values >= 0.
-    * The class with largest value p/t is predicted, where p is the original probability of that
-    * class and t is the class' threshold.
-    *
-    * Note: When [[setThresholds()]] is called, any user-set value for [[threshold]] will be cleared.
-    *       If both [[threshold]] and [[thresholds]] are set in a ParamMap, then they must be
-    *       equivalent.
-    *
-    * @group setParam
-    */
-  def setThresholds(value: Array[Double]): this.type = {
-    if (isSet(threshold)) clear(threshold)
-    set(thresholds, value)
-  }
-
-  /**
-    * Get thresholds for binary or multiclass classification.
-    *
-    * If [[thresholds]] is set, return its value.
-    * Otherwise, if [[threshold]] is set, return the equivalent thresholds for binary
-    * classification: (1-threshold, threshold).
-    * If neither are set, throw an exception.
-    *
-    * @group getParam
-    */
-  override def getThresholds: Array[Double] = {
-    checkThresholdConsistency()
-    if (!isSet(thresholds) && isSet(threshold)) {
-      val t = $(threshold)
-      Array(1-t, t)
-    } else {
-      $(thresholds)
-    }
-  }
-
-  /**
-    * If [[threshold]] and [[thresholds]] are both set, ensures they are consistent.
-    * @throws IllegalArgumentException if [[threshold]] and [[thresholds]] are not equivalent
-    */
-  protected def checkThresholdConsistency(): Unit = {
-    if (isSet(threshold) && isSet(thresholds)) {
-      val ts = $(thresholds)
-      require(ts.length == 2, "Logistic Regression found inconsistent values for threshold and" +
-        s" thresholds.  Param threshold is set (${$(threshold)}), indicating binary" +
-        s" classification, but Param thresholds is set with length ${ts.length}." +
-        " Clear one Param value to fix this problem.")
-      val t = 1.0 / (1.0 + ts(0) / ts(1))
-      require(math.abs($(threshold) - t) < 1E-5, "Logistic Regression getThreshold found" +
-        s" inconsistent values for threshold (${$(threshold)}) and thresholds (equivalent to $t)")
-    }
-  }
-
-  override def validateParams(): Unit = {
-    checkThresholdConsistency()
-  }
+  override def getThreshold: Double = $(threshold)
 }
 
 /**
   * Factorization machines.
-  * Currently, this class only supports binary classification.  It will support multiclass
-  * in the future.
+  * Currently, this class only supports binary classification.
   */
-class FactorizationMachine (override val uid: String, val numFactors: Int)
-  extends ProbabilisticClassifier[Vector, FactorizationMachine, FactorizationMachineModel]
-    with FactorizationMachineParams with DefaultParamsWritable with Logging {
+class FM(override val uid: String)
+  extends ProbabilisticClassifier[Vector, FM, FMModel]
+    with FMParams with DefaultParamsWritable with Logging {
 
-  require(numFactors > 0, "Factor number must > 0")
+  def this() = this(Identifiable.randomUID("fm"))
 
-  def this(numFactors: Int) = this(Identifiable.randomUID("fm"), numFactors)
-
-  def this() = this(20)
+  private var optInitialModel: Option[FMModel] = None
+  /** @group setParam */
+  private[spark] def setInitialModel(model: FMModel): this.type = {
+    this.optInitialModel = Some(model)
+    this
+  }
 
   /**
-    * Set the regularization parameter.
+    * Set the number of factors.
+    * Default is 10.
+    * @group setParam
+    */
+  def setRank(value: Int): this.type = set(rank, value)
+  setDefault(rank -> 10)
+
+  /**
+    * Set the L2-regularization parameter of first-order weights.
     * Default is 0.0.
     * @group setParam
     */
-  def setRegParam(value: Double): this.type = set(regParam, value)
-  setDefault(regParam -> 0.0)
+  def setRegParamFirst(value: Double): this.type = set(regParamFirst, value)
+  setDefault(regParamFirst -> 0.0)
 
   /**
-    * Set the ElasticNet mixing parameter.
-    * For alpha = 0, the penalty is an L2 penalty. For alpha = 1, it is an L1 penalty.
-    * For 0 < alpha < 1, the penalty is a combination of L1 and L2.
-    * Default is 0.0 which is an L2 penalty.
+    * Set the L2-regularization parameter of second-order factors.
+    * Default is 0.0.
     * @group setParam
     */
-  @Since("1.4.0")
-  def setElasticNetParam(value: Double): this.type = set(elasticNetParam, value)
-  setDefault(elasticNetParam -> 0.0)
+  def setRegParamSecond(value: Double): this.type = set(regParamSecond, value)
+  setDefault(regParamSecond -> 0.0)
 
   /**
     * Set the maximum number of iterations.
     * Default is 100.
     * @group setParam
     */
-  @Since("1.2.0")
   def setMaxIter(value: Int): this.type = set(maxIter, value)
   setDefault(maxIter -> 100)
 
@@ -196,7 +151,6 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     * Default is 1E-6.
     * @group setParam
     */
-  @Since("1.4.0")
   def setTol(value: Double): this.type = set(tol, value)
   setDefault(tol -> 1E-6)
 
@@ -205,27 +159,11 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     * Default is true.
     * @group setParam
     */
-  @Since("1.4.0")
   def setFitIntercept(value: Boolean): this.type = set(fitIntercept, value)
   setDefault(fitIntercept -> true)
 
-  /**
-    * Whether to standardize the training features before fitting the model.
-    * The coefficients of models will be always returned on the original scale,
-    * so it will be transparent for users. Note that with/without standardization,
-    * the models should be always converged to the same solution when no regularization
-    * is applied. In R's GLMNET package, the default behavior is true as well.
-    * Default is true.
-    * @group setParam
-    */
-  @Since("1.5.0")
-  def setStandardization(value: Boolean): this.type = set(standardization, value)
-  setDefault(standardization -> true)
-
-  @Since("1.5.0")
   override def setThreshold(value: Double): this.type = super.setThreshold(value)
 
-  @Since("1.5.0")
   override def getThreshold: Double = super.getThreshold
 
   /**
@@ -234,22 +172,15 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     * Default is not set, so all instances have weight one.
     * @group setParam
     */
-  @Since("1.6.0")
   def setWeightCol(value: String): this.type = set(weightCol, value)
 
-  @Since("1.5.0")
-  override def setThresholds(value: Array[Double]): this.type = super.setThresholds(value)
-
-  @Since("1.5.0")
-  override def getThresholds: Array[Double] = super.getThresholds
-
-  override protected[spark] def train(dataset: Dataset[_]): FactorizationMachineModel = {
+  override protected[spark] def train(dataset: Dataset[_]): FMModel = {
     val handlePersistence = dataset.rdd.getStorageLevel == StorageLevel.NONE
     train(dataset, handlePersistence)
   }
 
   protected[spark] def train(dataset: Dataset[_], handlePersistence: Boolean):
-  FactorizationMachineModel = {
+  FMModel = {
     val w = if (!isDefined(weightCol) || $(weightCol).isEmpty) lit(1.0) else col($(weightCol))
     val instances: RDD[Instance] =
       dataset.select(col($(labelCol)).cast(DoubleType), w, col($(featuresCol))).rdd.map {
@@ -260,7 +191,7 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     if (handlePersistence) instances.persist(StorageLevel.MEMORY_AND_DISK)
 
     val instr = Instrumentation.create(this, instances)
-    instr.logParams(regParam, elasticNetParam, standardization, threshold,
+    instr.logParams(rank, regParamFirst, regParamSecond, threshold,
       maxIter, tol, fitIntercept)
 
     val labelSummarizer = {
@@ -276,19 +207,14 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     val numInvalid = labelSummarizer.countInvalid
     val numClasses = histogram.length
     val numFeatures = instances.first.features.size
-
-    if (isDefined(thresholds)) {
-      require($(thresholds).length == numClasses, this.getClass.getSimpleName +
-        ".train() called with non-matching numClasses and thresholds.length." +
-        s" numClasses=$numClasses, but thresholds has length ${$(thresholds).length}")
-    }
+    val numParams = numFeatures * ($(rank) + 1)
 
     instr.logNumClasses(numClasses)
     instr.logNumFeatures(numFeatures)
 
     val (coefficients, intercept, objectiveHistory) = {
       if (numInvalid != 0) {
-        val msg = s"Classification labels should be in {0 to ${numClasses - 1} " +
+        val msg = s"Classification labels should be in {0 to ${numClasses - 1}" +
           s"Found $numInvalid invalid labels."
         logError(msg)
         throw new SparkException(msg)
@@ -318,51 +244,60 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
             s"so the algorithm may not converge.")
         }
 
-        val regParamL1 = $(elasticNetParam) * $(regParam)
-        val regParamL2 = (1.0 - $(elasticNetParam)) * $(regParam)
 
-        val costFun = new FactorCostFun(instances, numFeatures, numFactors,
-          numClasses, $(fitIntercept), regParamL2)
+        val costFun = new FactorCostFun(instances, numFeatures, $(rank), $(fitIntercept),
+          ${regParamFirst}, ${regParamSecond})
 
-        val optimizer = if ($(elasticNetParam) == 0.0 || $(regParam) == 0.0) {
-          new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+        val optimizer = new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+
+        val initialCoefficientsArray = Array.ofDim[Double](numParams + {if ($(fitIntercept)) 1 else 0})
+
+        // model update
+        if (optInitialModel.isDefined && optInitialModel.get.coefficientMatrix.numActives != numParams) {
+          val vecSize = optInitialModel.get.coefficientMatrix.numActives
+          logWarning(
+            s"Initial coefficients will be ignored!! As its size $vecSize did not match the " +
+              s"expected size $numParams")
+        }
+        if (optInitialModel.isDefined && optInitialModel.get.coefficientMatrix.numActives == numParams) {
+          optInitialModel.get.coefficientMatrix.foreachActive { case (row, col, value) =>
+            val index = row * numFeatures + col
+            initialCoefficientsArray(index) = value
+          }
+          if ($(fitIntercept)) {
+            initialCoefficientsArray(numParams) == optInitialModel.get.intercept
+          }
         } else {
-          throw new NotImplementedError("L1 regularation is not implemented")
+          // set up the initial values of factors
+          var i = numFeatures
+          while (i < numFeatures * ($(rank) + 1)) {
+            initialCoefficientsArray(i) = 0.5 / math.sqrt($(rank)) * (Random.nextDouble - 0.5)
+            i += 1
+          }
+          if ($(fitIntercept)) {
+            /*
+               For binary logistic regression, when we initialize the coefficients as zeros,
+               it will converge faster if we initialize the intercept such that
+               it follows the distribution of the labels.
+
+               {{{
+                 P(0) = 1 / (1 + \exp(b)), and
+                 P(1) = \exp(b) / (1 + \exp(b))
+               }}}, hence
+               {{{
+                 b = \log{P(1) / P(0)} = \log{count_1 / count_0}
+               }}}
+             */
+            initialCoefficientsArray(numParams) = math.log(histogram(1) / histogram(0))
+          }
         }
 
-        val initialCoefficientsArray = Array.fill[Double](
-          numFeatures * (numFactors + 1) + (if ($(fitIntercept)) 1 else 0))(
-          1 / math.sqrt(numFactors) * (Random.nextDouble - 0.5))
-        var i = 0
-        while (i < numFeatures) {
-          initialCoefficientsArray(i) = 0.0
-          i += 1
-        }
-        val initialCoefficientsWithIntercept = Vectors.dense(initialCoefficientsArray)
-
-        if ($(fitIntercept)) {
-          /*
-             For binary logistic regression, when we initialize the coefficients as zeros,
-             it will converge faster if we initialize the intercept such that
-             it follows the distribution of the labels.
-
-             {{{
-               P(0) = 1 / (1 + \exp(b)), and
-               P(1) = \exp(b) / (1 + \exp(b))
-             }}}, hence
-             {{{
-               b = \log{P(1) / P(0)} = \log{count_1 / count_0}
-             }}}
-           */
-          initialCoefficientsWithIntercept.toArray(numFeatures) = math.log(
-            histogram(1) / histogram(0))
-        }
-
+        val initialCoefficientsWithIntercept = BDV(initialCoefficientsArray)
         val states = optimizer.iterations(new CachedDiffFunction(costFun),
-          initialCoefficientsWithIntercept.asBreeze.toDenseVector)
+          initialCoefficientsWithIntercept)
 
         /*
-           Note that in Logistic Regression, the objective history (loss + regularization)
+           Note that in Factorization Machine, the objective history (loss + regularization)
            is log-likelihood which is invariance under feature standardization. As a result,
            the objective history from optimizer is the same as the one in the original space.
          */
@@ -377,11 +312,6 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
           val msg = s"${optimizer.getClass.getName} failed."
           logError(msg)
           throw new SparkException(msg)
-        }
-
-        if (!state.actuallyConverged) {
-          logWarning("FactorizationMachine training finished but the result " +
-            s"is not converged because: ${state.convergedReason.get.reason}")
         }
 
         /*
@@ -403,9 +333,11 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
 
     if (handlePersistence) instances.unpersist()
 
-    val model = copyValues(new FactorizationMachineModel(uid, numFactors, coefficients, intercept))
+    val model = copyValues(new FMModel(uid,
+      Matrices.dense(numFeatures, $(rank)+1, coefficients.toArray),
+      intercept))
     val (summaryModel, probabilityColName) = model.findSummaryModelAndProbabilityCol()
-    val fmSummary = new BinaryFactorizationMachineTrainingSummary(
+    val fmSummary = new BinaryFMTrainingSummary(
       summaryModel.transform(dataset),
       probabilityColName,
       $(labelCol),
@@ -416,61 +348,52 @@ class FactorizationMachine (override val uid: String, val numFactors: Int)
     m
   }
 
-  @Since("1.4.0")
-  override def copy(extra: ParamMap): FactorizationMachine = defaultCopy(extra)
+  override def copy(extra: ParamMap): FM = defaultCopy(extra)
 }
 
-@Since("1.6.0")
-object FactorizationMachine extends DefaultParamsReadable[FactorizationMachine] {
+object FM extends DefaultParamsReadable[FM] {
 
-  @Since("1.6.0")
-  override def load(path: String): FactorizationMachine = super.load(path)
+  override def load(path: String): FM = super.load(path)
 }
 
 /**
-  * Model produced by [[FactorizationMachine]].
+  * Model produced by [[FM]].
   */
-class FactorizationMachineModel private[spark](
-                                                override val uid: String,
-                                                val numFactors: Int,
-                                                val coefficients: Vector,
-                                                val intercept: Double)
-  extends ProbabilisticClassificationModel[Vector, FactorizationMachineModel]
-    with FactorizationMachineParams with MLWritable {
+class FMModel private[spark](
+                              override val uid: String,
+                              val coefficientMatrix: Matrix,
+                              val intercept: Double)
+  extends ProbabilisticClassificationModel[Vector, FMModel]
+    with FMParams with MLWritable {
 
   override def setThreshold(value: Double): this.type = super.setThreshold(value)
 
   override def getThreshold: Double = super.getThreshold
 
-  override def setThresholds(value: Array[Double]): this.type = super.setThresholds(value)
+  set(rank, coefficientMatrix.numCols - 1)
 
-  override def getThresholds: Array[Double] = super.getThresholds
+  override val numFeatures: Int = coefficientMatrix.numRows
 
-  override val numFeatures: Int = coefficients.size / (numFactors + 1)
+  override val numClasses: Int = 2
 
-  private val factorNorms = {
-    val coeffs = BDV(coefficients.toArray)
-    val factorMatrix = coeffs(numFeatures until numFeatures * (numFactors + 1))
-      .toDenseMatrix
-      .reshape(numFeatures, numFactors)
-    val squreMatrix = factorMatrix :* factorMatrix
-    Vectors.fromBreeze(sum(squreMatrix(*, ::)))
+  private val factorNorms: Vector = {
+    val breezeMatrix = coefficientMatrix.asBreeze.toDenseMatrix
+    val factorMatrix = breezeMatrix(::, 1 to -1)
+    val squareMatrix = factorMatrix :* factorMatrix
+    Vectors.fromBreeze(sum(squareMatrix(*, ::)))
   }
 
   /** Margin (rawPrediction) for class label 1.  For binary classification only. */
   private val margin: Vector => Double = (features) => {
-    val factorSumArray = Array.ofDim[Double](numFactors)
-    val coefficientsArray = coefficients.toArray
-    val numFeatures = features.size
+    val factorSumArray = Array.ofDim[Double]($(rank))
     var sum = 0.0
     features.foreachActive { (index, value) =>
       if (value != 0.0) {
-        sum += coefficientsArray(index) * value
+        sum += coefficientMatrix(index, 0) * value
         sum -= 0.5 * factorNorms(index) * value * value
         var iFactor = 0
-        while (iFactor < numFactors) {
-          val factorIndex = (iFactor + 1) * numFeatures + index
-          factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
+        while (iFactor < $(rank)) {
+          factorSumArray(iFactor) += coefficientMatrix(index, iFactor+1) * value
           iFactor += 1
         }
       }
@@ -479,23 +402,19 @@ class FactorizationMachineModel private[spark](
     sum + intercept
   }
 
-  /** Score (probability) for class label 1.  For binary classification only. */
+  /** Score (probability) for class label 1. For binary classification only. */
   private val score: Vector => Double = (features) => {
     val m = margin(features)
     1.0 / (1.0 + math.exp(-m))
   }
 
-
-  override val numClasses: Int = 2
-
-  private var trainingSummary: Option[FactorizationMachineTrainingSummary] = None
+  private var trainingSummary: Option[FMTrainingSummary] = None
 
   /**
     * Gets summary of model on training set. An exception is
     * thrown if `trainingSummary == None`.
     */
-  @Since("1.5.0")
-  def summary: FactorizationMachineTrainingSummary = trainingSummary.getOrElse {
+  def summary: FMTrainingSummary = trainingSummary.getOrElse {
     throw new SparkException("No training summary available for this LogisticRegressionModel")
   }
 
@@ -505,7 +424,7 @@ class FactorizationMachineModel private[spark](
     * of the current model.
     */
   private[classification] def findSummaryModelAndProbabilityCol():
-  (FactorizationMachineModel, String) = {
+  (FMModel, String) = {
     $(probabilityCol) match {
       case "" =>
         val probabilityColName = "probability_" + java.util.UUID.randomUUID.toString
@@ -515,24 +434,22 @@ class FactorizationMachineModel private[spark](
   }
 
   private[classification] def setSummary(
-                                          summary: FactorizationMachineTrainingSummary): this.type = {
+                                          summary: FMTrainingSummary): this.type = {
     this.trainingSummary = Some(summary)
     this
   }
 
   /** Indicates whether a training summary exists for this model instance. */
-  @Since("1.5.0")
   def hasSummary: Boolean = trainingSummary.isDefined
 
   /**
     * Evaluates the model on a test dataset.
     * @param dataset Test dataset to evaluate model on.
     */
-  @Since("2.0.0")
-  def evaluate(dataset: Dataset[_]): FactorizationMachineSummary = {
+  def evaluate(dataset: Dataset[_]): FMSummary = {
     // Handle possible missing or invalid prediction columns
     val (summaryModel, probabilityColName) = findSummaryModelAndProbabilityCol()
-    new BinaryFactorizationMachineSummary(summaryModel.transform(dataset),
+    new BinaryFMSummary(summaryModel.transform(dataset),
       probabilityColName, $(labelCol), $(featuresCol))
   }
 
@@ -566,9 +483,8 @@ class FactorizationMachineModel private[spark](
     Vectors.dense(-m, m)
   }
 
-  @Since("1.4.0")
-  override def copy(extra: ParamMap): FactorizationMachineModel = {
-    val newModel = copyValues(new FactorizationMachineModel(uid, numFactors, coefficients, intercept), extra)
+  override def copy(extra: ParamMap): FMModel = {
+    val newModel = copyValues(new FMModel(uid, coefficientMatrix, intercept), extra)
     if (trainingSummary.isDefined) newModel.setSummary(trainingSummary.get)
     newModel.setParent(parent)
   }
@@ -594,55 +510,56 @@ class FactorizationMachineModel private[spark](
   /**
     * Returns a [[org.apache.spark.ml.util.MLWriter]] instance for this ML instance.
     *
-    * For [[FactorizationMachineModel]], this does NOT currently save the training [[summary]].
+    * For [[FMModel]], this does NOT currently save the training [[summary]].
     * An option to save [[summary]] may be added in the future.
     *
     * This also does not save the [[parent]] currently.
     */
-  @Since("1.6.0")
-  override def write: MLWriter = new FactorizationMachineModel.FactorizationMachineModelWriter(this)
+  override def write: MLWriter = new FMModel.FMModelWriter(this)
 }
 
 
-@Since("1.6.0")
-object FactorizationMachineModel extends MLReadable[FactorizationMachineModel] {
+object FMModel extends MLReadable[FMModel] {
 
-  @Since("1.6.0")
-  override def read: MLReader[FactorizationMachineModel] = new LogisticRegressionModelReader
+  override def read: MLReader[FMModel] = new FMModelReader
 
-  @Since("1.6.0")
-  override def load(path: String): FactorizationMachineModel = super.load(path)
+  override def load(path: String): FMModel = super.load(path)
 
-  /** [[MLWriter]] instance for [[FactorizationMachineModel]] */
-  private[FactorizationMachineModel]
-  class FactorizationMachineModelWriter(instance: FactorizationMachineModel)
+  /** [[MLWriter]] instance for [[FMModel]] */
+  private[FMModel]
+  class FMModelWriter(instance: FMModel)
     extends MLWriter with Logging {
 
-    private case class Data(
-                             numClasses: Int,
-                             numFeatures: Int,
-                             intercept: Double,
-                             coefficients: Vector)
+    private case class Data(intercept: Double, coefficients: Matrix)
 
     override protected def saveImpl(path: String): Unit = {
       // Save metadata and Params
       DefaultParamsWriter.saveMetadata(instance, path, sc)
-      // Save model data: numClasses, numFeatures, intercept, coefficients
-      val data = Data(instance.numClasses, instance.numFeatures, instance.intercept,
-        instance.coefficients)
+      // Save model data: intercept, coefficients
+      val data = Data(instance.intercept, instance.coefficientMatrix)
       val dataPath = new Path(path, "data").toString
       sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }
   }
 
-  private class LogisticRegressionModelReader
-    extends MLReader[FactorizationMachineModel] {
+  private class FMModelReader extends MLReader[FMModel] {
 
     /** Checked against metadata when loading model */
-    private val className = classOf[FactorizationMachineModel].getName
+    private val className = classOf[FMModel].getName
 
-    override def load(path: String): FactorizationMachineModel = {
-      throw new SparkException("model loder not implemented")
+    override def load(path: String): FMModel = {
+      val metadata = DefaultParamsReader.loadMetadata(path, sc, className)
+
+      val dataPath = new Path(path, "data").toString
+      val data = sparkSession.read.format("parquet").load(dataPath)
+
+      val model = {
+        val Row(intercept: Double, coefficientMatrix: Matrix) = data.head()
+        new FMModel(metadata.uid, coefficientMatrix, intercept)
+      }
+
+      DefaultParamsReader.getAndSetParams(model, metadata)
+      model
     }
   }
 }
@@ -652,7 +569,7 @@ object FactorizationMachineModel extends MLReadable[FactorizationMachineModel] {
   * Currently, the training summary ignores the training weights except
   * for the objective trace.
   */
-sealed trait FactorizationMachineTrainingSummary extends FactorizationMachineSummary {
+sealed trait FMTrainingSummary extends FMSummary {
 
   /** objective function (scaled loss + regularization) at each iteration. */
   def objectiveHistory: Array[Double]
@@ -665,7 +582,7 @@ sealed trait FactorizationMachineTrainingSummary extends FactorizationMachineSum
 /**
   * Abstraction for Logistic Regression Results for a given model.
   */
-sealed trait FactorizationMachineSummary extends Serializable {
+sealed trait FMSummary extends Serializable {
 
   /** Dataframe output by the model's `transform` method. */
   def predictions: DataFrame
@@ -692,16 +609,14 @@ sealed trait FactorizationMachineSummary extends Serializable {
   * @param featuresCol field in "predictions" which gives the features of each instance as a vector.
   * @param objectiveHistory objective function (scaled loss + regularization) at each iteration.
   */
-@Experimental
-@Since("1.5.0")
-class BinaryFactorizationMachineTrainingSummary private[classification](
-                                                                        predictions: DataFrame,
-                                                                        probabilityCol: String,
-                                                                        labelCol: String,
-                                                                        featuresCol: String,
-                                                                        @Since("1.5.0") val objectiveHistory: Array[Double])
-  extends BinaryFactorizationMachineSummary(predictions, probabilityCol, labelCol, featuresCol)
-    with FactorizationMachineTrainingSummary {
+class BinaryFMTrainingSummary private[classification](
+                                                       predictions: DataFrame,
+                                                       probabilityCol: String,
+                                                       labelCol: String,
+                                                       featuresCol: String,
+                                                       val objectiveHistory: Array[Double])
+  extends BinaryFMSummary(predictions, probabilityCol, labelCol, featuresCol)
+    with FMTrainingSummary {
 
 }
 
@@ -716,12 +631,11 @@ class BinaryFactorizationMachineTrainingSummary private[classification](
   * @param featuresCol field in "predictions" which gives the features of each instance as a vector.
   */
 @Experimental
-@Since("1.5.0")
-class BinaryFactorizationMachineSummary private[classification](
-                                                                @Since("1.5.0") @transient override val predictions: DataFrame,
-                                                                @Since("1.5.0") override val probabilityCol: String,
-                                                                @Since("1.5.0") override val labelCol: String,
-                                                                @Since("1.6.0") override val featuresCol: String) extends FactorizationMachineSummary {
+class BinaryFMSummary private[classification](
+                                               @transient override val predictions: DataFrame,
+                                               override val probabilityCol: String,
+                                               override val labelCol: String,
+                                               override val featuresCol: String) extends FMSummary {
 
 
   private val sparkSession = predictions.sparkSession
@@ -744,38 +658,31 @@ class BinaryFactorizationMachineSummary private[classification](
     * with (0.0, 0.0) prepended and (1.0, 1.0) appended to it.
     * See http://en.wikipedia.org/wiki/Receiver_operating_characteristic
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     *       This will change in later Spark versions.
     */
-  @Since("1.5.0")
   @transient lazy val roc: DataFrame = binaryMetrics.roc().toDF("FPR", "TPR")
 
   /**
     * Computes the area under the receiver operating characteristic (ROC) curve.
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
-    *       This will change in later Spark versions.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     */
-  @Since("1.5.0")
   lazy val areaUnderROC: Double = binaryMetrics.areaUnderROC()
 
   /**
     * Returns the precision-recall curve, which is a Dataframe containing
     * two fields recall, precision with (0.0, 1.0) prepended to it.
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
-    *       This will change in later Spark versions.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     */
-  @Since("1.5.0")
   @transient lazy val pr: DataFrame = binaryMetrics.pr().toDF("recall", "precision")
 
   /**
     * Returns a dataframe with two fields (threshold, F-Measure) curve with beta = 1.0.
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
-    *       This will change in later Spark versions.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     */
-  @Since("1.5.0")
   @transient lazy val fMeasureByThreshold: DataFrame = {
     binaryMetrics.fMeasureByThreshold().toDF("threshold", "F-Measure")
   }
@@ -785,10 +692,8 @@ class BinaryFactorizationMachineSummary private[classification](
     * Every possible probability obtained in transforming the dataset are used
     * as thresholds used in calculating the precision.
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
-    *       This will change in later Spark versions.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     */
-  @Since("1.5.0")
   @transient lazy val precisionByThreshold: DataFrame = {
     binaryMetrics.precisionByThreshold().toDF("threshold", "precision")
   }
@@ -798,33 +703,30 @@ class BinaryFactorizationMachineSummary private[classification](
     * Every possible probability obtained in transforming the dataset are used
     * as thresholds used in calculating the recall.
     *
-    * Note: This ignores instance weights (setting all to 1.0) from `LogisticRegression.weightCol`.
-    *       This will change in later Spark versions.
+    * Note: This ignores instance weights (setting all to 1.0) from `FM.weightCol`.
     */
-  @Since("1.5.0")
   @transient lazy val recallByThreshold: DataFrame = {
     binaryMetrics.recallByThreshold().toDF("threshold", "recall")
   }
 }
 /**
-  * FactorAggregator computes the gradient and loss for binary logistic loss function, as used
+  * FactorAggregator computes the gradient and loss for binary FM loss function, as used
   * in binary classification for instances in sparse or dense vector in an online fashion.
   *
-  * Note that multinomial logistic loss is not supported yet!
-  *
-  * Two LogisticAggregator can be merged together to have a summary of loss and gradient of
+  * Two FactorAggregator can be merged together to have a summary of loss and gradient of
   * the corresponding joint dataset.
   *
-  * @param numClasses the number of possible outcomes for k classes classification problem in
-  *                   Multinomial Logistic Regression.
+  * @param bcCoefficients The broadcast coefficients corresponding to the features.
+  * @param bcFactorNorms The broadcast L2 norm of factors.
   * @param fitIntercept Whether to fit an intercept term.
   */
 private class FactorAggregator(
-                                private val numFeatures: Int,
-                                private val numFactors: Int,
-                                numClasses: Int,
+                                bcCoefficients: Broadcast[Vector],
+                                bcFactorNorms: Broadcast[Array[Double]],
                                 fitIntercept: Boolean) extends Serializable with Logging {
 
+  private val numFeatures = bcFactorNorms.value.length
+  private val numFactors = (bcCoefficients.value.size  - {if (fitIntercept) 1 else 0}) / numFeatures - 1
   private var weightSum = 0.0
   private var lossSum = 0.0
   private var iFactor = 0
@@ -837,19 +739,18 @@ private class FactorAggregator(
     * of the objective function.
     *
     * @param instance The instance of data point to be added.
-    * @param coefficients The coefficients corresponding to the features.
     * @return This LogisticAggregator object.
     */
-  def add(
-           instance: Instance,
-           coefficients: Vector,
-           factorNorms: Vector): this.type = {
+  def add( instance: Instance): this.type = {
     instance match { case Instance(label, weight, features) =>
       require(numFeatures == features.size, s"Dimensions mismatch when adding new instance." +
         s" Expecting $numFeatures but got ${features.size}.")
       require(weight >= 0.0, s"instance weight, $weight has to be >= 0.0")
 
       if (weight == 0.0) return this
+
+      val coefficients = bcCoefficients.value
+      val factorNorms = bcFactorNorms.value
 
       val coefficientsArray = coefficients match {
         case dv: DenseVector => dv.values
@@ -860,61 +761,54 @@ private class FactorAggregator(
       val localGradientSumArray = gradientSumArray
       val factorSumArray = Array.ofDim[Double](numFactors)
 
-      numClasses match {
-        case 2 =>
-          // For Binary Logistic Regression.
-          val margin = - {
-            var sum = 0.0
-            features.foreachActive { (index, value) =>
-              if (value != 0.0) {
-                sum += coefficientsArray(index) * value
-                sum -= 0.5 * factorNorms(index) * value * value
-                iFactor = 0
-                while (iFactor < numFactors) {
-                  val factorIndex = (iFactor + 1) * numFeatures + index
-                  factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
-                  iFactor += 1
-                }
-              }
-            }
-            sum += 0.5 * factorSumArray.map(f => f * f).sum
-            sum + {
-              if (fitIntercept) coefficientsArray.last else 0.0
+      val margin = - {
+        var sum = 0.0
+        features.foreachActive { (index, value) =>
+          if (value != 0.0) {
+            sum += coefficientsArray(index) * value
+            sum -= 0.5 * factorNorms(index) * value * value
+            iFactor = 0
+            while (iFactor < numFactors) {
+              val factorIndex = (iFactor + 1) * numFeatures + index
+              factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
+              iFactor += 1
             }
           }
+        }
+        sum += 0.5 * factorSumArray.map(f => f * f).sum
+        sum + {
+          if (fitIntercept) coefficientsArray.last else 0.0
+        }
+      }
 
-          val multiplier = weight * (1.0 / (1.0 + math.exp(margin)) - label)
+      val multiplier = weight * (1.0 / (1.0 + math.exp(margin)) - label)
 
-          features.foreachActive { (index, value) =>
-            if (value != 0.0) {
-              localGradientSumArray(index) += multiplier * value
-              iFactor = 0
-              while (iFactor < numFactors) {
-                val factorIndex = (iFactor + 1) * numFeatures + index
-                localGradientSumArray(factorIndex) += multiplier * value *
-                  (factorSumArray(iFactor) - coefficientsArray(factorIndex) * value)
-                iFactor += 1
-              }
-            }
+      features.foreachActive { (index, value) =>
+        if (value != 0.0) {
+          localGradientSumArray(index) += multiplier * value
+          iFactor = 0
+          while (iFactor < numFactors) {
+            val factorIndex = (iFactor + 1) * numFeatures + index
+            localGradientSumArray(factorIndex) += multiplier * value *
+              (factorSumArray(iFactor) - coefficientsArray(factorIndex) * value)
+            iFactor += 1
           }
+        }
+      }
 
-          if (fitIntercept) {
-            localGradientSumArray(numFeatures * (numFactors + 1)) += multiplier
-          }
+      if (fitIntercept) {
+        localGradientSumArray(numFeatures * (numFactors + 1)) += multiplier
+      }
 
-          if (label > 0) {
-            // The following is equivalent to log(1 + exp(margin)) but more numerically stable.
-            lossSum += weight * MLUtils.log1pExp(margin)
-          } else {
-            lossSum += weight * (MLUtils.log1pExp(margin) - margin)
-          }
-        case _ =>
-          new NotImplementedError("LogisticRegression with ElasticNet in ML package " +
-            "only supports binary classification for now.")
+      if (label > 0) {
+        // The following is equivalent to log(1 + exp(margin)) but more numerically stable.
+        lossSum += weight * MLUtils.log1pExp(margin)
+      } else {
+        lossSum += weight * (MLUtils.log1pExp(margin) - margin)
       }
       weightSum += weight
-      this
     }
+    this
   }
 
   /**
@@ -926,8 +820,9 @@ private class FactorAggregator(
     * @return This LogisticAggregator object.
     */
   def merge(other: FactorAggregator): this.type = {
-    require(numFeatures == other.numFeatures, s"Dimensions mismatch when merging with another " +
-      s"LeastSquaresAggregator. Expecting $numFeatures but got ${other.numFeatures}.")
+    require(numFeatures == other.numFeatures && numFactors == other.numFactors,
+      s"Dimensions mismatch when merging with another FactorAggregator" +
+      s"Expecting ($numFeatures, $numFactors) but got (${other.numFeatures}, ${other.numFactors}).")
 
     if (other.weightSum != 0.0) {
       weightSum += other.weightSum
@@ -948,7 +843,6 @@ private class FactorAggregator(
   def loss: Double = {
     require(weightSum > 0.0, s"The effective number of instances should be " +
       s"greater than 0.0, but $weightSum.")
-    println(s"weightSum : $weightSum, lossSum: $lossSum")
     lossSum / weightSum
   }
 
@@ -962,8 +856,7 @@ private class FactorAggregator(
 }
 
 /**
-  * LogisticCostFun implements Breeze's DiffFunction[T] for a multinomial logistic loss function,
-  * as used in multi-class classification (it is also used in binary logistic regression).
+  * FactorCostFun implements Breeze's StochasticDiffFunction[T] for a FM function.
   * It returns the loss and gradient with L2 regularization at a particular point (coefficients).
   * It's used in Breeze's convex optimization routines.
   */
@@ -971,32 +864,33 @@ private class FactorCostFun(
                              instances: RDD[Instance],
                              numFeatures: Int,
                              numFactors: Int,
-                             numClasses: Int,
                              fitIntercept: Boolean,
-                             regParamL2: Double) extends DiffFunction[BDV[Double]] {
+                             regParam1: Double,
+                             regParam2: Double) extends DiffFunction[BDV[Double]] {
 
   override def calculate(coefficients: BDV[Double]): (Double, BDV[Double]) = {
     val coeffs = Vectors.fromBreeze(coefficients)
     val factorMatrix = coefficients(numFeatures until numFeatures * (numFactors + 1))
       .toDenseMatrix
       .reshape(numFeatures, numFactors)
-    val squreMatrix = factorMatrix :* factorMatrix
-    val factorNorms = Vectors.fromBreeze(sum(squreMatrix(*, ::)))
+    val squareMatrix = factorMatrix :* factorMatrix
+    val factorNorms = sum(squareMatrix(*, ::))
 
+    val bcCoefficients = instances.context.broadcast(coeffs)
+    val bcFactorNorms = instances.context.broadcast(factorNorms.toArray)
     val factorAggregator = {
-      val seqOp = (c: FactorAggregator, instance: Instance) =>
-        c.add(instance, coeffs, factorNorms)
+      val seqOp = (c: FactorAggregator, instance: Instance) => c.add(instance)
       val combOp = (c1: FactorAggregator, c2: FactorAggregator) => c1.merge(c2)
 
       instances.treeAggregate(
-        new FactorAggregator(numFeatures, numFactors, numClasses, fitIntercept)
+        new FactorAggregator(bcCoefficients, bcFactorNorms, fitIntercept)
       )(seqOp, combOp)
     }
 
     val totalGradientArray = factorAggregator.gradient.toArray
 
     // regVal is the sum of coefficients squares excluding intercept for L2 regularization.
-    val regVal = if (regParamL2 == 0.0) {
+    val regVal = if (regParam1 == 0.0 && regParam2 == 0.0) {
       0.0
     } else {
       var sum = 0.0
@@ -1004,18 +898,20 @@ private class FactorCostFun(
         // If `fitIntercept` is true, the last term which is intercept doesn't
         // contribute to the regularization.
         if (index != numFeatures * (numFactors + 1)) {
+          val regParam = if (index < numFeatures) regParam1 else regParam2
           // The following code will compute the loss of the regularization; also
           // the gradient of the regularization, and add back to totalGradientArray.
           sum += {
-            totalGradientArray(index) += regParamL2 * value
-            value * value
+            totalGradientArray(index) += regParam * value
+            0.5 * regParam * value * value
           }
         }
       }
-      0.5 * regParamL2 * sum
+      sum
     }
 
-    println(s"factorAggregator loss: ${factorAggregator.loss}, regval: $regVal")
+    // TODO log loss and regval
+    println(s"FM loss: ${factorAggregator.loss}, regval: $regVal")
     (factorAggregator.loss + regVal, new BDV(totalGradientArray))
   }
 }
