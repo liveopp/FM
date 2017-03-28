@@ -70,12 +70,11 @@ object FMTest {
       .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
       .getOrCreate
     import spark.implicits._
-    val dataset = spark.read.parquet("/data/cupid_algo/cpc/ctr/feature/dt=2016-09-20")
+    val dataset = spark.read.parquet("data")
     val pos = dataset.filter("label = 1")
     val neg = dataset.filter("label = 0").sample(false, 0.1)
     val sampled = pos.union(neg).persist
-    val onehotDF = oneHotEncoder(sampled, sampled.schema.fieldNames.filter(
-      f => f != "uaa_user_id" && f != "label" ))
+    val onehotDF = oneHotEncoder(sampled, sampled.schema.fieldNames
     val assembler = new VectorAssembler()
       .setInputCols(onehotDF.schema.fieldNames.filter(_ != "label"))
       .setOutputCol("features")
