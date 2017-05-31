@@ -20,10 +20,10 @@ package org.apache.spark.ml.classification
 import scala.collection.mutable
 import scala.util.Random
 import breeze.linalg.{*, sum, DenseVector => BDV}
-import breeze.optimize.{DiffFunction, CachedDiffFunction, LBFGS => BreezeLBFGS}
+import breeze.optimize.{CachedDiffFunction, DiffFunction, LBFGS => BreezeLBFGS, OWLQN => BreezeOWLQN}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.SparkException
-import org.apache.spark.annotation.{Experimental, Since}
+import org.apache.spark.annotation.Experimental
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.ml.feature.Instance
@@ -54,6 +54,26 @@ private[classification] trait FMParams extends ProbabilisticClassifierParams
 
   /** @group getParam */
   def getRank: Int = $(rank)
+
+  /**
+    * Param for L1 regularization of first-order weights (positive).
+    * @group param
+    */
+  val regParamL1 = new DoubleParam(this, "regParamL1",
+    "L1-regularization parameter for first-order weights", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegParamL1: Double = $(regParamL1)
+
+  /**
+    * Param for features column beginIndex for L1 regularization.
+    * @group param
+    */
+  val regParamL1Index = new IntParam(this, "regParamL1Index",
+    "features column beginIndex for L1-regularization", ParamValidators.gtEq(0))
+
+  /** @group getParam */
+  def getRegParamL1Index: Int = $(regParamL1Index)
 
   /**
     * Param for L2 regularization of first-order weights (positive).
@@ -120,6 +140,22 @@ class FM(override val uid: String)
     */
   def setRank(value: Int): this.type = set(rank, value)
   setDefault(rank -> 10)
+
+  /**
+    * Set the L1-regularization parameter of first-order weights.
+    * Default is 0.0.
+    * @group setParam
+    */
+  def setRegParamL1(value: Double): this.type = set(regParamL1, value)
+  setDefault(regParamL1 -> 0.0)
+
+  /**
+    * Set the L1-regularization parameter of features column beginIndex.
+    * Default is 0.
+    * @group setParam
+    */
+  def setRegParamL1Index(value: Int): this.type = set(regParamL1Index, value)
+  setDefault(regParamL1Index -> 0)
 
   /**
     * Set the L2-regularization parameter of first-order weights.
@@ -221,8 +257,8 @@ class FM(override val uid: String)
       }
 
       if (numClasses > 2) {
-        val msg = s"Currently, LogisticRegression with ElasticNet in ML package only supports " +
-          s"binary classification. Found $numClasses in the input dataset."
+        val msg = s"Currently, FM only supports binary classification." +
+          s" Found $numClasses in the input dataset."
         logError(msg)
         throw new SparkException(msg)
       } else if ($(fitIntercept) && numClasses == 2 && histogram(0) == 0.0) {
@@ -243,12 +279,6 @@ class FM(override val uid: String)
           logWarning(s"All labels are zero and fitIntercept=false. It's a dangerous ground, " +
             s"so the algorithm may not converge.")
         }
-
-
-        val costFun = new FactorCostFun(instances, numFeatures, $(rank), $(fitIntercept),
-          ${regParamFirst}, ${regParamSecond})
-
-        val optimizer = new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
 
         val initialCoefficientsArray = Array.ofDim[Double](numParams + {if ($(fitIntercept)) 1 else 0})
 
@@ -271,7 +301,7 @@ class FM(override val uid: String)
           // set up the initial values of factors
           var i = numFeatures
           while (i < numFeatures * ($(rank) + 1)) {
-            initialCoefficientsArray(i) = 0.5 / math.sqrt($(rank)) * (Random.nextDouble - 0.5)
+            initialCoefficientsArray(i) = math.sqrt($(rank)) * (Random.nextDouble - 0.5) / 50
             i += 1
           }
           if ($(fitIntercept)) {
@@ -292,15 +322,35 @@ class FM(override val uid: String)
           }
         }
 
+
+        /*
+            Use L-BFGS for L2 regularization, OWL-QN for L1 regularization.
+         */
+
         val initialCoefficientsWithIntercept = BDV(initialCoefficientsArray)
+        val costFun = new FactorCostFun(instances, numFeatures, $(rank), $(fitIntercept),
+          $(regParamFirst), $(regParamSecond), $(regParamL1) > 0.0)
+
+        val optimizer = if ($(regParamL1) == 0.0) {
+          new BreezeLBFGS[BDV[Double]]($(maxIter), 10, $(tol))
+        } else {
+          val l1reg = (index: Int) => {
+            if (index < $(regParamL1Index) && index < numFeatures) {
+              $(regParamL1)
+            } else {
+              0
+            }
+          }
+          new BreezeOWLQN[Int, BDV[Double]]($(maxIter), 10, l1reg, $(tol))
+        }
         val states = optimizer.iterations(new CachedDiffFunction(costFun),
           initialCoefficientsWithIntercept)
 
         /*
-           Note that in Factorization Machine, the objective history (loss + regularization)
-           is log-likelihood which is invariance under feature standardization. As a result,
-           the objective history from optimizer is the same as the one in the original space.
-         */
+         Note that in Factorization Machine, the objective history (loss + regularization)
+         is log-likelihood which is invariance under feature standardization. As a result,
+         the objective history from optimizer is the same as the one in the original space.
+       */
         val arrayBuilder = mutable.ArrayBuilder.make[Double]
         var state: optimizer.State = null
         while (states.hasNext) {
@@ -315,12 +365,16 @@ class FM(override val uid: String)
         }
 
         /*
-           The coefficients are trained in the scaled space; we're converting them back to
-           the original space.
-           Note that the intercept in scaled space and original space is the same;
-           as a result, no scaling is needed.
-         */
-        val rawCoefficients = state.x.toArray.clone()
+         The coefficients are trained in the scaled space; we're converting them back to
+         the original space.
+         Note that the intercept in scaled space and original space is the same;
+         as a result, no scaling is needed.
+       */
+        val rawCoefficients = if ($(regParamL1) == 0.0) {
+          state.x.toArray.clone()
+        } else {
+          FMSparse.makeSparse(state.x, numFeatures, $(rank)).clone()
+        }
 
         if ($(fitIntercept)) {
           (Vectors.dense(rawCoefficients.dropRight(1)).compressed, rawCoefficients.last,
@@ -717,16 +771,15 @@ class BinaryFMSummary private[classification](
   * the corresponding joint dataset.
   *
   * @param bcCoefficients The broadcast coefficients corresponding to the features.
-  * @param bcFactorNorms The broadcast L2 norm of factors.
+  * @param numFeatures number of features
   * @param fitIntercept Whether to fit an intercept term.
   */
-private class FactorAggregator(
-                                bcCoefficients: Broadcast[Vector],
-                                bcFactorNorms: Broadcast[Array[Double]],
-                                fitIntercept: Boolean) extends Serializable with Logging {
+private class FactorAggregator(bcCoefficients: Broadcast[Vector],
+                               private val numFeatures: Int,
+                               fitIntercept: Boolean,
+                               isSparse: Boolean = false) extends Serializable with Logging {
 
-  private val numFeatures = bcFactorNorms.value.length
-  private val numFactors = (bcCoefficients.value.size  - {if (fitIntercept) 1 else 0}) / numFeatures - 1
+  private val numFactors: Int = (bcCoefficients.value.size  - {if (fitIntercept) 1 else 0}) / numFeatures - 1
   private var weightSum = 0.0
   private var lossSum = 0.0
   private var iFactor = 0
@@ -750,7 +803,6 @@ private class FactorAggregator(
       if (weight == 0.0) return this
 
       val coefficients = bcCoefficients.value
-      val factorNorms = bcFactorNorms.value
 
       val coefficientsArray = coefficients match {
         case dv: DenseVector => dv.values
@@ -766,12 +818,14 @@ private class FactorAggregator(
         features.foreachActive { (index, value) =>
           if (value != 0.0) {
             sum += coefficientsArray(index) * value
-            sum -= 0.5 * factorNorms(index) * value * value
-            iFactor = 0
-            while (iFactor < numFactors) {
-              val factorIndex = (iFactor + 1) * numFeatures + index
-              factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
-              iFactor += 1
+            if (!isSparse || coefficientsArray(index) != 0.0) {
+              iFactor = 0
+              while (iFactor < numFactors) {
+                val factorIndex = (iFactor + 1) * numFeatures + index
+                sum -= 0.5 * coefficientsArray(factorIndex) * coefficientsArray(factorIndex) * value * value
+                factorSumArray(iFactor) += coefficientsArray(factorIndex) * value
+                iFactor += 1
+              }
             }
           }
         }
@@ -786,12 +840,14 @@ private class FactorAggregator(
       features.foreachActive { (index, value) =>
         if (value != 0.0) {
           localGradientSumArray(index) += multiplier * value
-          iFactor = 0
-          while (iFactor < numFactors) {
-            val factorIndex = (iFactor + 1) * numFeatures + index
-            localGradientSumArray(factorIndex) += multiplier * value *
-              (factorSumArray(iFactor) - coefficientsArray(factorIndex) * value)
-            iFactor += 1
+          if (!isSparse || coefficientsArray(index) != 0.0) {
+            iFactor = 0
+            while (iFactor < numFactors) {
+              val factorIndex = (iFactor + 1) * numFeatures + index
+              localGradientSumArray(factorIndex) += multiplier * value *
+                (factorSumArray(iFactor) - coefficientsArray(factorIndex) * value)
+              iFactor += 1
+            }
           }
         }
       }
@@ -860,30 +916,24 @@ private class FactorAggregator(
   * It returns the loss and gradient with L2 regularization at a particular point (coefficients).
   * It's used in Breeze's convex optimization routines.
   */
-private class FactorCostFun(
-                             instances: RDD[Instance],
-                             numFeatures: Int,
-                             numFactors: Int,
-                             fitIntercept: Boolean,
-                             regParam1: Double,
-                             regParam2: Double) extends DiffFunction[BDV[Double]] {
+private class FactorCostFun(instances: RDD[Instance],
+                            numFeatures: Int,
+                            numFactors: Int,
+                            fitIntercept: Boolean,
+                            regParam1: Double,
+                            regParam2: Double,
+                            isSparse: Boolean = false) extends DiffFunction[BDV[Double]] {
 
   override def calculate(coefficients: BDV[Double]): (Double, BDV[Double]) = {
     val coeffs = Vectors.fromBreeze(coefficients)
-    val factorMatrix = coefficients(numFeatures until numFeatures * (numFactors + 1))
-      .toDenseMatrix
-      .reshape(numFeatures, numFactors)
-    val squareMatrix = factorMatrix :* factorMatrix
-    val factorNorms = sum(squareMatrix(*, ::))
 
     val bcCoefficients = instances.context.broadcast(coeffs)
-    val bcFactorNorms = instances.context.broadcast(factorNorms.toArray)
     val factorAggregator = {
       val seqOp = (c: FactorAggregator, instance: Instance) => c.add(instance)
       val combOp = (c1: FactorAggregator, c2: FactorAggregator) => c1.merge(c2)
 
       instances.treeAggregate(
-        new FactorAggregator(bcCoefficients, bcFactorNorms, fitIntercept)
+        new FactorAggregator(bcCoefficients, numFeatures, fitIntercept, isSparse)
       )(seqOp, combOp)
     }
 
@@ -916,3 +966,23 @@ private class FactorCostFun(
   }
 }
 
+object FMSparse {
+
+  def makeSparse(w: BDV[Double], numFeatures: Int, numFactors: Int): Array[Double] = {
+    require(w.length >= numFeatures * (numFactors + 1),
+      "The length of weight vector must be equal with number of columns of factor matrix.")
+    var i = 0
+    while (i < numFeatures) {
+      var j = 0
+      if (w(i) == 0.0) {
+        while (j < numFactors) {
+          val index = (j + 1) * numFeatures + i
+          w(index) = 0.0
+          j += 1
+        }
+      }
+      i += 1
+    }
+    w.toArray
+  }
+}
