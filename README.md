@@ -4,3 +4,4 @@
 
 ## Roadmap ##
 1. Support parallel SGD
+2. Use Vector free LBGFS to support training with 1B features
