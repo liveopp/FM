@@ -37,22 +37,6 @@
             <scope>provided</scope>
         </dependency>
     </dependencies>
-
-    <repositories>
-        <repository>
-            <id>iqiyi-internal-repo</id>
-            <name>Iqiyi Internal</name>
-            <url>http://maven.qiyi.virtual/a/repository</url>
-        </repository>
-    </repositories>
-
-    <pluginRepositories>
-        <pluginRepository>
-            <id>iqiyi-internal-repo</id>
-            <name>Iqiyi Internal</name>
-            <url>http://maven.qiyi.virtual/a/repository</url>
-        </pluginRepository>
-    </pluginRepositories>
     <build>
         <sourceDirectory>src/main/scala</sourceDirectory>
         <plugins>
@@ -109,28 +93,6 @@
                         <javacArg>-target</javacArg>
                         <javacArg>${java.version}</javacArg>
                     </javacArgs>
-                </configuration>
-            </plugin>
-            <plugin>
-                <groupId>com.iqiyi.europa</groupId>
-                <artifactId>europa-maven-plugin</artifactId>
-                <version>${europa.version}</version>
-                <configuration>
-                    <token>jimmyzhang@MCILGAEXANHFHWOKYAZXUFPRAJMYRTKN</token>
-                    <project>cupid_algo</project>
-                    <jar>target/${project.artifactId}-${project.version}.jar</jar>
-                    <mainClass>FMTest</mainClass>
-                    <jobName>cupid_algo_test_fm</jobName>
-                    <cluster>Jiyang</cluster>
-                    <principal>cupid_algo</principal>
-                    <queue>cupid_algo</queue>
-                    <sparkVersion>${spark.version}</sparkVersion>
-                    <driverMemory>26</driverMemory>
-                    <driverCores>4</driverCores>
-                    <numExecutors>100</numExecutors>
-                    <executorCores>2</executorCores>
-                    <executorMemory>26</executorMemory>
-                    <log4jLevel>ERROR</log4jLevel>
                 </configuration>
             </plugin>
         </plugins>
